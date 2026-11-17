@@ -9,10 +9,12 @@ relays between them. SCAT turns DIAG into GSMTAP; pycrate decodes MIB and SIBs.
 import argparse
 import datetime
 import pathlib
+import re
 import shlex
 import shutil
 import signal
 import socket
+import statistics
 import subprocess
 import sys
 import threading
@@ -25,7 +27,7 @@ from rich import panel
 from rich import table
 from rich import text
 
-__version__ = '0.1.0'
+__version__ = '0.1.1'
 
 DEVICE_PORT = 25010
 SCAT_PORT = 25012
@@ -80,12 +82,12 @@ def _plmns(info):
     return out
 
 
-def _read_sib(summary, val):
+def _read_sib(cell, val):
     kind, body = val[1]
     if kind == 'systemInformationBlockType1':
         info = body['cellAccessRelatedInfo']
         # One update: a message that lacks a field leaves no half-filled cell.
-        summary.update({
+        cell.update({
             'plmn': _plmns(info),
             'tac': info['trackingAreaCode'][0],
             'eci': info['cellIdentity'][0],
@@ -95,39 +97,40 @@ def _read_sib(summary, val):
         return
     for sib, sib_val in body['criticalExtensions'][1]['sib-TypeAndInfo']:
         if sib == 'sib4':
-            summary['neigh_intra'] = [
+            cell['neigh_intra'] = [
                 c['physCellId']
                 for c in sib_val.get('intraFreqNeighCellList', [])
             ]
         elif sib == 'sib5':
             for f in sib_val['interFreqCarrierFreqList']:
-                summary['neigh_inter'][f['dl-CarrierFreq']] = (
+                cell['neigh_inter'][f['dl-CarrierFreq']] = (
                     f.get('cellReselectionPriority'), [
                         c['physCellId']
                         for c in f.get('interFreqNeighCellList', [])
                     ])
         elif sib == 'sib6':
             for f in sib_val.get('carrierFreqListUTRA-FDD', []):
-                summary['utra'][f['carrierFreq']] = f.get(
+                cell['utra'][f['carrierFreq']] = f.get(
                     'cellReselectionPriority')
         elif sib == 'sib24-v1530':
             for f in sib_val.get('carrierFreqListNR-r15', []):
-                summary['nr'][f['carrierFreq-r15']] = (f.get(
+                cell['nr'][f['carrierFreq-r15']] = (f.get(
                     'multiBandInfoList-r15',
                     []), f.get('cellReselectionPriority-r15'))
 
 
+def _new_cell():
+    return {'neigh_intra': [], 'neigh_inter': {}, 'utra': {}, 'nr': {}}
+
+
 def summarize(packets):
-    """Collect cell facts from raw GSMTAP packets; count the broken ones."""
-    summary = {
-        'earfcn': set(),
-        'neigh_intra': [],
-        'neigh_inter': {},
-        'utra': {},
-        'nr': {},
-        'errors': 0,
-        'paging': 0
-    }
+    """Collect cell facts per EARFCN from raw GSMTAP packets.
+
+    MIB and SIB2+ carry no cell identity, so the GSMTAP EARFCN is the only key
+    shared by all broadcasts of one cell. 'last' is the EARFCN of the last
+    broadcast, i.e. the cell the modem read most recently.
+    """
+    summary = {'cells': {}, 'last': None, 'errors': 0, 'paging': 0}
     for pkt in packets:
         parsed = parse_gsmtap(pkt)
         if not parsed or parsed[0] != GSMTAP_LTE_RRC:
@@ -137,16 +140,39 @@ def summarize(packets):
             summary['paging'] += 1
         if sub not in (SUB_BCCH_BCH, SUB_BCCH_DL_SCH):
             continue
-        summary['earfcn'].add(arfcn)
+        cell = summary['cells'].setdefault(arfcn, _new_cell())
+        summary['last'] = arfcn
         try:
             val = decode_bcch(sub, payload)['message']
             if sub == SUB_BCCH_BCH:
-                summary['bandwidth'] = val['dl-Bandwidth']
+                cell['bandwidth'] = val['dl-Bandwidth']
             else:
-                _read_sib(summary, val)
+                _read_sib(cell, val)
         except Exception:  # pylint: disable=broad-exception-caught
             summary['errors'] += 1
     return summary
+
+
+# SCAT log line for one LTE serving-cell measurement (ML1).
+_MEAS = re.compile(r'LTE SCell: EARFCN: (\d+), PCI: \d+, '
+                   r'Measured RSRP: (-?[\d.]+), .*Measured RSRQ: (-?[\d.]+)')
+
+
+def measurements(log_lines):
+    """Group SCAT LTE serving-cell measurements by EARFCN.
+
+    Returns ({earfcn: [(rsrp, rsrq), ...]}, other SCell/NCell lines). The
+    EARFCN is cut to 14 bits to match the GSMTAP key.
+    """
+    by_cell, other = {}, []
+    for line in log_lines:
+        m = _MEAS.search(line)
+        if m:
+            by_cell.setdefault(int(m[1]) & 0x3FFF, []).append(
+                (float(m[2]), float(m[3])))
+        elif ('SCell' in line or 'NCell' in line) and 'LTE RRC' not in line:
+            other.append(line.strip())
+    return by_cell, other
 
 
 def cellmapper_url(plmn):
@@ -160,56 +186,84 @@ def _ids(values):
     return ', '.join(map(str, values)) or '-'
 
 
-def render(summary, measurements):
-    """Build the result tables as rich renderables."""
-    out = []
-    if 'eci' in summary:
-        cell = table.Table(title='Serving cell (SIB1)',
-                           box=box.ROUNDED,
-                           show_header=False,
-                           title_justify='left')
-        cell.add_column(style='bold')
-        cell.add_column()
-        for key, value in [
-            ('PLMN', ', '.join(summary['plmn'])),
-            ('TAC', f"{summary['tac']} (0x{summary['tac']:04X})"),
-            ('ECI', f"{summary['eci']} (0x{summary['eci']:07X})"),
-            ('eNB / sector',
-             f"[bold cyan]{summary['eci'] >> 8}[/] / {summary['eci'] & 0xFF}"),
-            ('Band', str(summary['band'])),
-            ('EARFCN', _ids(sorted(summary['earfcn']))),
-            ('Bandwidth', summary.get('bandwidth', '?')),
-            ('Barred', summary['barred'])
-        ]:
-            cell.add_row(key, value)
-        out.append(cell)
+def _stats(values):
+    return (f'{statistics.median(values):.1f} '
+            f'[dim](min {min(values):.1f}, max {max(values):.1f})[/]')
+
+
+def _cell_table(earfcn, cell, meas, last):
+    title = f'Cell on EARFCN {earfcn}' + (' [bold](read last)[/]'
+                                           if last else '')
+    t = table.Table(title=title,
+                    box=box.ROUNDED,
+                    show_header=False,
+                    title_justify='left')
+    t.add_column(style='bold')
+    t.add_column()
+    rows = []
+    if 'eci' in cell:
+        eci = cell['eci']
+        rows += [('PLMN', ', '.join(cell['plmn'])),
+                 ('TAC', f"{cell['tac']} (0x{cell['tac']:04X})"),
+                 ('ECI', f'{eci} (0x{eci:07X})'),
+                 ('eNB / sector', f'[bold cyan]{eci >> 8}[/] / {eci & 0xFF}'),
+                 ('Band', str(cell['band'])), ('Barred', cell['barred'])]
     else:
-        out.append('[yellow]No SIB1 received.[/] Try --reselect.')
-    neigh = table.Table(title='Neighbours announced by the cell',
-                        box=box.ROUNDED,
-                        title_justify='left')
+        rows.append(('SIB1', '[yellow]not received[/], try --reselect'))
+    rows.append(('Bandwidth', cell.get('bandwidth', '?')))
+    if meas:
+        rows += [('RSRP dBm', _stats([m[0] for m in meas])),
+                 ('RSRQ dB', _stats([m[1] for m in meas])),
+                 ('Measurements', str(len(meas)))]
+    for key, value in rows:
+        t.add_row(key, value)
+    return t
+
+
+def _neigh_table(earfcn, cell):
+    t = table.Table(title=f'Neighbours announced on EARFCN {earfcn}',
+                    box=box.ROUNDED,
+                    title_justify='left')
     for col in ('Layer', 'Frequency', 'Priority', 'PCIs'):
-        neigh.add_column(col, overflow='fold')
-    if summary['neigh_intra']:
-        neigh.add_row('LTE same freq (SIB4)',
-                      f"EARFCN {_ids(sorted(summary['earfcn']))}", '-',
-                      _ids(summary['neigh_intra']))
-    for earfcn, (prio, pcis) in summary['neigh_inter'].items():
-        neigh.add_row('LTE (SIB5)', f'EARFCN {earfcn}', str(prio), _ids(pcis))
-    for freq, prio in summary['utra'].items():
-        neigh.add_row('3G (SIB6)', f'UARFCN {freq}', str(prio), '-')
-    for freq, (bands, prio) in summary['nr'].items():
-        neigh.add_row('5G NR (SIB24)',
-                      f"NR-ARFCN {freq} (n{','.join(map(str, bands))})",
-                      str(prio), '-')
-    if neigh.row_count:
-        out.append(neigh)
+        t.add_column(col, overflow='fold')
+    if cell['neigh_intra']:
+        t.add_row('LTE same freq (SIB4)', f'EARFCN {earfcn}', '-',
+                  _ids(cell['neigh_intra']))
+    for freq, (prio, pcis) in cell['neigh_inter'].items():
+        t.add_row('LTE (SIB5)', f'EARFCN {freq}', str(prio), _ids(pcis))
+    for freq, prio in cell['utra'].items():
+        t.add_row('3G (SIB6)', f'UARFCN {freq}', str(prio), '-')
+    for freq, (bands, prio) in cell['nr'].items():
+        t.add_row('5G NR (SIB24)',
+                  f"NR-ARFCN {freq} (n{','.join(map(str, bands))})",
+                  str(prio), '-')
+    return t
+
+
+def render(summary, log_lines):
+    """Build one table pair per cell, then counts, other lines and the link."""
+    by_cell, other = measurements(log_lines)
+    out = []
+    for earfcn, cell in summary['cells'].items():
+        out.append(
+            _cell_table(earfcn, cell, by_cell.get(earfcn),
+                        earfcn == summary['last'] and
+                        len(summary['cells']) > 1))
+        neigh = _neigh_table(earfcn, cell)
+        if neigh.row_count:
+            out.append(neigh)
+    if not any('eci' in c for c in summary['cells'].values()):
+        out.append('[yellow]No SIB1 received.[/] Try --reselect.')
     out.append(f"Paging messages: {summary['paging']}   "
                f"Decode errors: {summary['errors']}")
-    out += measurements or ['Signal measurements: [dim]none received[/]']
-    if 'plmn' in summary:
-        out.append(f"CellMapper: {cellmapper_url(summary['plmn'][0])}  "
-                   f"[dim](search eNB {summary['eci'] >> 8})[/]")
+    if not by_cell:
+        out.append('Signal measurements: [dim]none received[/]')
+    out += other[-5:]
+    identified = [c for c in summary['cells'].values() if 'eci' in c]
+    if identified:
+        enbs = _ids(sorted({c['eci'] >> 8 for c in identified}))
+        out.append(f"CellMapper: {cellmapper_url(identified[-1]['plmn'][0])}"
+                   f'  [dim](search eNB {enbs})[/]')
     return out
 
 
@@ -391,9 +445,8 @@ def run(args):
         restore(device, scat, radio_off, rayhunter)
     log_file = out / 'scat.log'
     log_lines = log_file.read_text().splitlines() if log_file.exists() else []
-    lines = [ln.strip() for ln in log_lines if 'SCell' in ln or 'NCell' in ln]
     console.rule('Result')
-    for item in render(summarize(packets), lines[-5:]):
+    for item in render(summarize(packets), log_lines):
         console.print(item)
     console.print(f'Files: {out}')
     if failed:

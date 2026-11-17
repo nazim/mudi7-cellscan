@@ -143,26 +143,27 @@ class SummarizeTest(unittest.TestCase):
     def test_sib1_fields_and_inherited_mcc(self):
         s = cellscan.summarize(
             [gsmtap(5, encode(RRC.BCCH_DL_SCH_Message, SIB1))])
-        self.assertEqual(s['plmn'], ['001-01', '001-02'])
-        self.assertEqual((s['tac'], s['eci'], s['band'], s['barred']),
-                         (0x0102, 0x0012345, 3, 'notBarred'))
-        self.assertEqual(s['earfcn'], {1300})
+        cell = s['cells'][1300]
+        self.assertEqual(cell['plmn'], ['001-01', '001-02'])
+        self.assertEqual((cell['tac'], cell['eci'], cell['band'],
+                          cell['barred']), (0x0102, 0x0012345, 3, 'notBarred'))
+        self.assertEqual(list(s['cells']), [1300])
 
     def test_mib_bandwidth(self):
         s = cellscan.summarize([gsmtap(4, encode(RRC.BCCH_BCH_Message, MIB))])
-        self.assertEqual(s['bandwidth'], 'n50')
+        self.assertEqual(s['cells'][1300]['bandwidth'], 'n50')
 
     def test_neighbour_lists(self):
         s = cellscan.summarize(
             [gsmtap(5, encode(RRC.BCCH_DL_SCH_Message, SIB4_5))])
-        self.assertEqual(s['neigh_intra'], [7, 8])
-        self.assertEqual(s['neigh_inter'], {1300: (5, [9])})
+        self.assertEqual(s['cells'][1300]['neigh_intra'], [7, 8])
+        self.assertEqual(s['cells'][1300]['neigh_inter'], {1300: (5, [9])})
 
     def test_paging_counted_other_types_ignored(self):
         s = cellscan.summarize(
             [gsmtap(6, b'\x40'),
              gsmtap(5, b'\x00', gsmtap_type=0x12), b'junk'])
-        self.assertEqual((s['paging'], s['errors'], s['earfcn']), (1, 0, set()))
+        self.assertEqual((s['paging'], s['errors'], s['cells']), (1, 0, {}))
 
     def test_broken_payload_counted_not_raised(self):
         s = cellscan.summarize([gsmtap(5, b'')])
@@ -181,7 +182,56 @@ class SummarizeTest(unittest.TestCase):
             for v in (extension, future)
         ])
         self.assertEqual(s['errors'], 2)
-        self.assertNotIn('eci', s)
+        self.assertNotIn('eci', s['cells'][1300])
+
+    def test_two_cells_kept_apart(self):
+        body = dict(SIB1['message'][1][1])
+        body['cellAccessRelatedInfo'] = dict(body['cellAccessRelatedInfo'],
+                                             cellIdentity=(0x0012399, 28))
+        body['freqBandIndicator'] = 1
+        other = {'message': ('c1', ('systemInformationBlockType1', body))}
+        s = cellscan.summarize([
+            gsmtap(5, encode(RRC.BCCH_DL_SCH_Message, SIB1), arfcn=1300),
+            gsmtap(4, encode(RRC.BCCH_BCH_Message, MIB), arfcn=1300),
+            gsmtap(5, encode(RRC.BCCH_DL_SCH_Message, SIB4_5), arfcn=1300),
+            gsmtap(5, encode(RRC.BCCH_DL_SCH_Message, other), arfcn=400),
+        ])
+        a, b = s['cells'][1300], s['cells'][400]
+        self.assertEqual((a['eci'], a['band'], a['bandwidth']),
+                         (0x0012345, 3, 'n50'))
+        self.assertEqual((b['eci'], b['band']), (0x0012399, 1))
+        self.assertNotIn('bandwidth', b)
+        self.assertEqual((a['neigh_intra'], b['neigh_intra']), ([7, 8], []))
+        self.assertEqual(s['last'], 400)
+
+
+SCAT_LOG = [
+    'Radio 0: LTE SCell: EARFCN: 1300, PCI: 5, Measured RSRP: -88.00, '
+    'Measured RSSI: -55.00, Measured RSRQ: -12.00',
+    'Radio 0: LTE RRC SCell Info: EARFCN: 1300/19300, Band: 3, PCI: 5',
+    'Radio 0: LTE SCell: EARFCN: 1300, PCI: 5, Measured RSRP: -90.00, '
+    'Measured RSSI: -57.00, Measured RSRQ: -14.00',
+    'Radio 0: LTE SCell: EARFCN: 400, PCI: 5, Measured RSRP: -100.50, '
+    'Measured RSSI: -70.00, Measured RSRQ: -11.25',
+    'Radio 0: NR RRC SCell Info: NR-ARFCN: 365070/345092, PCI: 781',
+    'unrelated line',
+]
+
+
+class MeasurementsTest(unittest.TestCase):
+
+    def test_grouped_by_earfcn_rest_kept(self):
+        by_cell, other = cellscan.measurements(SCAT_LOG)
+        self.assertEqual(by_cell, {
+            1300: [(-88.0, -12.0), (-90.0, -14.0)],
+            400: [(-100.5, -11.25)]
+        })
+        self.assertEqual(other, [SCAT_LOG[4]])
+
+    def test_earfcn_cut_to_gsmtap_bits(self):
+        line = SCAT_LOG[0].replace('EARFCN: 1300', 'EARFCN: 66786')
+        self.assertEqual(list(cellscan.measurements([line])[0]),
+                         [66786 & 0x3FFF])
 
 
 def as_text(items):
@@ -210,6 +260,20 @@ class RenderTest(unittest.TestCase):
         text = as_text(cellscan.render(s, []))
         self.assertIn('LTE same freq (SIB4)', text)
         self.assertIn('EARFCN 1300', text)
+
+    def test_measurements_in_their_cell_and_last_marked(self):
+        s = cellscan.summarize([
+            gsmtap(5, encode(RRC.BCCH_DL_SCH_Message, SIB1), arfcn=400),
+            gsmtap(5, encode(RRC.BCCH_DL_SCH_Message, SIB1), arfcn=1300),
+        ])
+        text = as_text(cellscan.render(s, SCAT_LOG))
+        first, second = text.split('Cell on EARFCN 1300')
+        self.assertIn('-100.5', first)
+        self.assertNotIn('-89.0', first)
+        self.assertIn('(read last)', second[:20])
+        self.assertIn('-89.0 (min -90.0, max -88.0)', second)
+        self.assertNotIn('none received', text)
+        self.assertIn('NR RRC SCell Info', text)
 
     def test_no_sib1_hint_and_no_link(self):
         text = as_text(cellscan.render(cellscan.summarize([]), []))

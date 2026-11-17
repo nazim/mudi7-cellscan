@@ -61,15 +61,18 @@ python3 -m venv .venv
 ### Output
 
 The scan starts with a header panel. Each step prints ✓ or ✗, and a
-countdown shows the packets received so far. At the end you get two tables:
+countdown shows the packets received so far. At the end you get two tables
+for each cell the modem read (one EARFCN each):
 
-- **Serving cell (SIB1):** PLMN, TAC, ECI, eNB and sector, band, EARFCN,
-  bandwidth and barred state.
-- **Neighbours announced by the cell:** LTE (SIB4, SIB5), 3G (SIB6) and
+- **Cell on EARFCN …:** PLMN, TAC, ECI, eNB and sector, band, bandwidth and
+  barred state. With a SIM, also the median, min and max RSRP and RSRQ the
+  modem measured on that cell. The cell whose broadcast came last is marked
+  "read last".
+- **Neighbours announced on EARFCN …:** LTE (SIB4, SIB5), 3G (SIB6) and
   5G NR (SIB24) frequencies, with priority and PCIs.
 
-Below the tables are the paging count, decode errors, signal measurements
-and a CellMapper link:
+Below the tables are the paging count, decode errors, the last 5 other SCAT
+cell lines (for example 5G NR) and a CellMapper link:
 
 ```text
 CellMapper: https://www.cellmapper.net/map?MCC=1&MNC=1&type=LTE  (search eNB 291)
@@ -105,7 +108,7 @@ Each restore step runs even if an earlier one fails. A failed step is printed.
 ## Limits
 
 - No signal strength without a SIM. The modem sends no RSRP measurements in
-  this state, so the tool cannot estimate distance.
+  this state.
 - One cell only. The modem reads SIB1 only from the cell it camps on. Other
   cells appear only as PCI numbers in the neighbour lists.
 - LTE only. 5G NR cells appear only as frequencies in SIB24.

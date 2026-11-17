@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.1 - 2026-11-17
+
+- summary: keeps MIB, SIB1 and neighbour lists per EARFCN; two cells no longer merge into one table
+- summary: marks the cell read last
+- output: RSRP and RSRQ median, min and max per cell from SCAT measurements
+- output: CellMapper hint lists every eNB seen
+
 ## 0.1.0 - 2026-11-12
 
 - relay: bridges diag_socket_log on the router and SCAT on the computer over TCP
